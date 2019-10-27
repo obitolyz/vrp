@@ -191,8 +191,7 @@ class Decoder(nn.Module):
             _, logits = self.pointer(g_l, context)
 
             logits, logit_mask = self.apply_mask_to_logits(logits, logit_mask, prev_idxs)
-            # if logits are all -inf, probs: [batch_size x sourceL]
-
+            # probs: [batch_size x sourceL]
             probs = self.sm(logits)
             return hy, cy, probs, logit_mask
 
@@ -213,7 +212,7 @@ class Decoder(nn.Module):
         rc_ct = torch.FloatTensor([self.vehicle_init_capacity, 0]).repeat(batch_size, 1)
 
         if self.decode_type == 'stochastic':
-            # at most twice (seq_len - 1)
+            # at most twice (seq_len - 1), seq_len: service_num + depot_num
             for _ in range((self.seq_len - 1) * 2):
                 hx, cx, probs, mask = recurrence(decoder_input, hidden, mask, idxs)
                 # select the next inputs for the decoder [batch_size x hidden_dim]
@@ -260,7 +259,11 @@ class Decoder(nn.Module):
         """
         batch_size = probs.size(0)
         # idxs is [batch_size]
-        idxs = probs.multinomial(1).squeeze(1)  # if data is all 0
+        # if prob is all nan, select depot 0
+        replace = torch.zeros(probs.size())
+        replace[:, 0] = 1
+        probs = torch.where(probs != probs, replace, probs)
+        idxs = probs.multinomial(1).squeeze(1)
 
         # nonzero
         nonzero_idxs = torch.nonzero(idxs).squeeze(1)
@@ -398,11 +401,16 @@ class CriticNetwork(nn.Module):
                  n_process_blocks,
                  tanh_exploration,
                  use_tanh,
-                 use_cuda):
+                 use_cuda,
+                 seq_len,
+                 p_dim=128,
+                 R=4):
         super(CriticNetwork, self).__init__()
 
         self.hidden_dim = hidden_dim
         self.n_process_blocks = n_process_blocks
+
+        self.s2v = Struct2Vec(seq_len, p_dim, R)
 
         self.encoder = Encoder(embedding_dim,
                                hidden_dim,
@@ -422,8 +430,10 @@ class CriticNetwork(nn.Module):
     def forward(self, inputs):
         """
         Args:
-            inputs: [sourceL x batch_size x embedding_dim] of embedded inputs
+            inputs: [batch_size x sourceL x input_dim]
         """
+        # [sourceL x batch_size x embedded_dim]
+        inputs = self.s2v(inputs.permute(1, 0, 2))
 
         (encoder_hx, encoder_cx) = self.encoder.enc_init_state  # [hidden_dim]
         encoder_hx = encoder_hx.unsqueeze(0).repeat(inputs.size(1), 1).unsqueeze(0)  # [1 x batch_size x hidden_dim]
@@ -488,12 +498,15 @@ class NeuralCombOptRL(nn.Module):
             n_process_blocks,
             tanh_exploration,
             False,
-            use_cuda)
+            use_cuda,
+            seq_len,
+            p_dim,
+            R)
 
     def forward(self, inputs):
         """
         Args:
-            inputs: [batch_size, sourceL, input_dim]
+            inputs: [batch_size x sourceL x input_dim]
         """
         batch_size = inputs.size(0)
 
