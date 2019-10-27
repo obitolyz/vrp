@@ -192,6 +192,7 @@ class Decoder(nn.Module):
 
             logits, logit_mask = self.apply_mask_to_logits(logits, logit_mask, prev_idxs)
             # if logits are all -inf, probs: [batch_size x sourceL]
+
             probs = self.sm(logits)
             return hy, cy, probs, logit_mask
 
