@@ -11,7 +11,8 @@ from torch.utils.data import Dataset
 
 
 class VRPDataset(Dataset):
-    def __init__(self, service_num, num_samples=1000000, random_seed=111):
+    def __init__(self, node_num, num_samples=1000000, random_seed=111):
+        # service_num: node_num - 1
         super(VRPDataset, self).__init__()
         random.seed(random_seed)
         self.dataset = []
@@ -19,7 +20,7 @@ class VRPDataset(Dataset):
         for _ in tqdm(range(num_samples)):
             sample = list()
             sample.append(torch.FloatTensor([random.uniform(0, 1), random.uniform(0, 1), 0, 0, 0, 0]))
-            for i in range(service_num):
+            for i in range(node_num - 1):
                 x, y = random.uniform(0, 1), random.uniform(0, 1)
                 capacity = random.randint(1, 10)
                 t1 = random.uniform(0, 5)

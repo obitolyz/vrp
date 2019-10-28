@@ -1,3 +1,4 @@
+import copy
 import torch
 import torch.nn as nn
 from torch.nn import Parameter
@@ -41,11 +42,13 @@ class Encoder(nn.Module):
 
 
 class Struct2Vec(nn.Module):
-    def __init__(self, node_num=21, p_dim=128, R=4):
+    def __init__(self, node_num, use_cuda, p_dim, R):
         super(Struct2Vec, self).__init__()
+        self.use_cuda = use_cuda
         self.node_num = node_num
         self.p_dim = p_dim
         self.R = R
+        self.relu = torch.tanh
         self.theta_1 = nn.Linear(self.p_dim, self.p_dim, bias=False)  # mu
         self.theta_2 = nn.Linear(self.p_dim, self.p_dim, bias=False)  # ll-w
         self.theta_3 = nn.Linear(1, self.p_dim, bias=False)  # l-w
@@ -62,14 +65,17 @@ class Struct2Vec(nn.Module):
         N = self.node_num
         mu = torch.zeros(N, batch_size, self.p_dim)
         mu_null = torch.zeros(N, batch_size, self.p_dim)
+        if self.use_cuda:
+            mu = mu.cuda()
+            mu_null = mu_null.cuda()
         for _ in range(self.R):
             for i in range(N):
                 item_1 = self.theta_1(torch.sum(mu, dim=0) - mu[i])
                 item_2 = self.theta_2(sum(
-                    [torch.relu(self.theta_3(torch.norm(inputs[i][:, :2] - inputs[j][:, :2], dim=1, keepdim=True))) for
+                    [self.relu(self.theta_3(torch.norm(inputs[i][:, :2] - inputs[j][:, :2], dim=1, keepdim=True))) for
                      j in range(N)]))
                 item_3 = self.theta_5(inputs[i][:, :2]) if i == 0 else self.theta_4(inputs[i])
-                mu_null[i] = torch.relu(item_1 + item_2 + item_3)
+                mu_null[i] = self.relu(item_1 + item_2 + item_3)
             mu = mu_null.clone()
 
         return mu
@@ -84,7 +90,7 @@ class Attention(nn.Module):
         self.project_query = nn.Linear(dim, dim)
         self.project_ref = nn.Conv1d(dim, dim, 1, 1)
         self.C = C  # tanh exploration
-        self.tanh = nn.Tanh()
+        self.tanh = torch.tanh
 
         v = torch.FloatTensor(dim)
         if use_cuda:
@@ -166,7 +172,7 @@ class Decoder(nn.Module):
             logits[maskk] = -np.inf
         return logits, maskk
 
-    def forward(self, decoder_input, before_embedded_inputs, embedded_inputs, hidden, context):
+    def forward(self, decoder_input, before_embedded_inputs, embedded_inputs, hidden_origin, context_origin):
         """
         Args:
             decoder_input: The initial input to the decoder
@@ -179,8 +185,11 @@ class Decoder(nn.Module):
         """
 
         def recurrence(x, hidden, logit_mask, prev_idxs):
-
+            x = x.unsqueeze(0)
+            hidden = (hidden[0].unsqueeze(0), hidden[1].unsqueeze(0))
             output, (hy, cy) = self.decoder_lstm(x, hidden)
+            hy = hy.squeeze(0)
+            cy = cy.squeeze(0)
 
             g_l = hy
             for _ in range(self.n_glimpses):
@@ -194,6 +203,9 @@ class Decoder(nn.Module):
             # probs: [batch_size x sourceL]
             probs = self.sm(logits)
             return hy, cy, probs, logit_mask
+
+        hidden = (hidden_origin[0].clone().detach(), hidden_origin[1].clone().detach())  ###
+        context = context_origin.clone().detach()
 
         batch_size = context.size(1)
         sourceL = context.size(0)
@@ -209,18 +221,23 @@ class Decoder(nn.Module):
         outputs.append(prob_0)
 
         # record (remaining capacity, current time, distance, penalty_capacity, penalty_time)
-        rc_ct_d_pc_pt = torch.FloatTensor([self.vehicle_init_capacity, 0, 0, 0, 0]).repeat(batch_size, 1)
+        rc_ct_d_pc_pt = torch.FloatTensor([self.vehicle_init_capacity, 0, 0, 0, 0]).repeat(batch_size, 1).detach_()
+        if self.use_cuda:
+            rc_ct_d_pc_pt = rc_ct_d_pc_pt.cuda()
 
         if self.decode_type == 'stochastic':
             # at most twice (seq_len - 1), seq_len: service_num + depot_num
             for _ in range((self.seq_len - 1) * 2):
+                if self.use_cuda:
+                    decoder_input = decoder_input.cuda()
                 hx, cx, probs, mask = recurrence(decoder_input, hidden, mask, idxs)
                 # select the next inputs for the decoder [batch_size x hidden_dim]
                 decoder_input, zero_idxs, idxs, rc_ct_d_pc_pt, before_embedded_inputs, embedded_inputs = self.decode_stochastic(
                     probs, before_embedded_inputs, embedded_inputs, idxs, rc_ct_d_pc_pt)
 
                 # re-encode the embedded_inputs which are modified
-                context_change, (enc_h_t_change, enc_c_t_change) = self.encoder(embedded_inputs[:, zero_idxs, :])
+                context_change, (enc_h_t_change, enc_c_t_change) = self.encoder(embedded_inputs[:, zero_idxs, :],
+                                                                                None)  # h0, c0 is default 0
 
                 # update context, hidden
                 context[:, zero_idxs, :] = context_change
@@ -262,6 +279,8 @@ class Decoder(nn.Module):
         # if prob is all nan, select depot 0
         replace = torch.zeros(probs.size())
         replace[:, 0] = 1
+        if self.use_cuda:
+            replace = replace.cuda()
         probs = torch.where(probs != probs, replace, probs)
         idxs = probs.multinomial(1).squeeze(1)
 
@@ -270,10 +289,10 @@ class Decoder(nn.Module):
         before_embedded_inputs[idxs[nonzero_idxs], nonzero_idxs, -1] = 1  # convert h to 1
 
         # zero
-        zero_idxs = torch.from_numpy(np.where(idxs == 0)[0])
-        if zero_idxs:
-            re_before_embedded_inputs = before_embedded_inputs[0, zero_idxs, :]  # this part needs to re-embed
-            embedded_inputs[0, zero_idxs, :] = self.s2v(re_before_embedded_inputs)
+        zero_idxs = torch.from_numpy(np.where(idxs.cpu() == 0)[0])
+        if len(zero_idxs) != 0:
+            re_before_embedded_inputs = before_embedded_inputs[:, zero_idxs, :]  # this part needs to re-embed
+            embedded_inputs[:, zero_idxs, :] = self.s2v(re_before_embedded_inputs)
 
         # remaining capacity, current time
         # if vehicle returns to depot 0, set remaining capacity to vehicle_init_capacity, current time to 0
@@ -299,11 +318,14 @@ class Decoder(nn.Module):
                     rc_ct_d_pc_pt[i][1] = cur_t
 
                 rc_ct_d_pc_pt[i][0] = rc_ct_d_pc_pt[i][0] - required_capacity[i]
-                rc_ct_d_pc_pt[i][-1] += max(rc_ct_d_pc_pt[i][-1] - t_2[i], 0)  # penalty time
-                rc_ct_d_pc_pt[i][-2] += max(-rc_ct_d_pc_pt[i][0], 0)  # penalty capacity
+                rc_ct_d_pc_pt[i][-1] = rc_ct_d_pc_pt[i][-1] + max(rc_ct_d_pc_pt[i][-1] - t_2[i], 0)  # penalty time
+                rc_ct_d_pc_pt[i][-2] = rc_ct_d_pc_pt[i][-2] + max(-rc_ct_d_pc_pt[i][0], 0)  # penalty capacity
 
-        rc_ct_d_pc_pt[:, 2] += distance.view(-1, 1)  # cumulative distance
-        rc_ct_d_pc_pt[zero_idxs, :2] = torch.FloatTensor([self.vehicle_init_capacity, 0])  # reset capacity and time
+        rc_ct_d_pc_pt[:, 2] = rc_ct_d_pc_pt[:, 2] + distance  # cumulative distance
+        reset_rc_ct = torch.FloatTensor([self.vehicle_init_capacity, 0])
+        if self.use_cuda:
+            reset_rc_ct = reset_rc_ct.cuda()
+        rc_ct_d_pc_pt[zero_idxs, :2] = reset_rc_ct  # reset capacity and time
 
         sels[:, -2:] = rc_ct_d_pc_pt[:, :2].clone()  # clone part of rc_ct_pc_pt
 
@@ -332,7 +354,7 @@ class PointerNetwork(nn.Module):
         self.vehicle_init_capacity = vehicle_init_capacity
         self.embedding_dim = embedding_dim
 
-        self.Struct2Vec = Struct2Vec(seq_len, p_dim, R)
+        self.Struct2Vec = Struct2Vec(seq_len, use_cuda, p_dim, R)
 
         self.encoder = Encoder(
             embedding_dim,
@@ -367,11 +389,11 @@ class PointerNetwork(nn.Module):
             inputs: [batch_size x sourceL x input_dim]
         """
         # embedded_inputs: [sourceL x batch_size x embedding_dim]
-        embedded_inputs = self.Struct2Vec(inputs.permute(1, 0, 2))
+        inputs = inputs.permute(1, 0, 2)
+        embedded_inputs = self.Struct2Vec(inputs)
 
         (encoder_hx, encoder_cx) = self.encoder.enc_init_state
-        encoder_hx = encoder_hx.unsqueeze(0).repeat(embedded_inputs.size(1), 1).unsqueeze(
-            0)  # [1 x batch_size x hidden_dim]
+        encoder_hx = encoder_hx.unsqueeze(0).repeat(embedded_inputs.size(1), 1).unsqueeze(0)  # [1 x batch_size x hidden_dim]
         encoder_cx = encoder_cx.unsqueeze(0).repeat(embedded_inputs.size(1), 1).unsqueeze(0)
 
         # encoder forward pass
@@ -407,14 +429,14 @@ class CriticNetwork(nn.Module):
                  use_tanh,
                  use_cuda,
                  seq_len,
-                 p_dim=128,
-                 R=4):
+                 p_dim,
+                 R):
         super(CriticNetwork, self).__init__()
 
         self.hidden_dim = hidden_dim
         self.n_process_blocks = n_process_blocks
 
-        self.s2v = Struct2Vec(seq_len, p_dim, R)
+        self.s2v = Struct2Vec(seq_len, use_cuda, p_dim, R)
 
         self.encoder = Encoder(embedding_dim,
                                hidden_dim,
@@ -471,14 +493,12 @@ class NeuralCombOptRL(nn.Module):
                  tanh_exploration,  # C
                  use_tanh,
                  beam_size,
-                 objective_fn,  # reward function
                  is_train,
                  use_cuda,
                  vehicle_init_capacity,
-                 p_dim=128,
-                 R=4):
+                 p_dim,
+                 R):
         super(NeuralCombOptRL, self).__init__()
-        self.objective_fn = objective_fn
         self.is_train = is_train
         self.use_cuda = use_cuda
 
@@ -516,7 +536,7 @@ class NeuralCombOptRL(nn.Module):
 
         # query the actor net for the input indices
         # making up the output, and the pointer attn
-        probs_, action_idxs, dist_pc_pt = self.actor_net(inputs)
+        probs_, action_idxs, dist_pc_pt = self.actor_net(copy.deepcopy(inputs))
         # probs_: [seq_len x batch_size x seq_len], action_idxs: [seq_len x batch_size]
 
         if self.is_train:
@@ -532,9 +552,13 @@ class NeuralCombOptRL(nn.Module):
         C1 = 1e-4
         C2 = 1e-2
         C3 = 1e-2
-        R = torch.mm(dist_pc_pt, torch.FloatTensor([C1, C2, C3]).view(-1, 1))
+        cff = torch.FloatTensor([C1, C2, C3])
+        if self.use_cuda:
+            cff = cff.cuda()
+
+        R = torch.mm(dist_pc_pt, cff.view(-1, 1)).squeeze(1)  # calc reward
         # get the critic value fn estimates for the baseline
         # [batch_size]
-        b = self.critic_net(inputs).view(-1, 1)
+        b = self.critic_net(inputs).squeeze(1)
 
         return R, b, probs, action_idxs
