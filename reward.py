@@ -3,3 +3,7 @@
 # @Author  : obitolyz
 # @FileName: reward.py
 # @Software: PyCharm
+
+
+def reward():
+    pass

@@ -208,16 +208,16 @@ class Decoder(nn.Module):
         prob_0.index_fill_(1, choose_i, 1)
         outputs.append(prob_0)
 
-        # record remaining capacity and current time
-        rc_ct = torch.FloatTensor([self.vehicle_init_capacity, 0]).repeat(batch_size, 1)
+        # record (remaining capacity, current time, distance, penalty_capacity, penalty_time)
+        rc_ct_d_pc_pt = torch.FloatTensor([self.vehicle_init_capacity, 0, 0, 0, 0]).repeat(batch_size, 1)
 
         if self.decode_type == 'stochastic':
             # at most twice (seq_len - 1), seq_len: service_num + depot_num
             for _ in range((self.seq_len - 1) * 2):
                 hx, cx, probs, mask = recurrence(decoder_input, hidden, mask, idxs)
                 # select the next inputs for the decoder [batch_size x hidden_dim]
-                decoder_input, zero_idxs, idxs, rc_ct, before_embedded_inputs, embedded_inputs = self.decode_stochastic(
-                    probs, before_embedded_inputs, embedded_inputs, idxs, rc_ct)
+                decoder_input, zero_idxs, idxs, rc_ct_d_pc_pt, before_embedded_inputs, embedded_inputs = self.decode_stochastic(
+                    probs, before_embedded_inputs, embedded_inputs, idxs, rc_ct_d_pc_pt)
 
                 # re-encode the embedded_inputs which are modified
                 context_change, (enc_h_t_change, enc_c_t_change) = self.encoder(embedded_inputs[:, zero_idxs, :])
@@ -232,7 +232,7 @@ class Decoder(nn.Module):
                 outputs.append(probs)
                 selections.append(idxs)
 
-            return (outputs, selections), hidden
+            return (outputs, selections), hidden, rc_ct_d_pc_pt[:, -3:]
 
         elif self.decode_type == 'greedy':
             # embedded_inputs: [sourceL x batch_size x embedding_dim]
@@ -241,7 +241,7 @@ class Decoder(nn.Module):
             # context: [sourceL x batch_size x hidden_dim]
             pass
 
-    def decode_stochastic(self, probs, before_embedded_inputs, embedded_inputs, prev_idxs, rc_ct):
+    def decode_stochastic(self, probs, before_embedded_inputs, embedded_inputs, prev_idxs, rc_ct_d_pc_pt):
         """
         Return the next input for the decoder by selecting the
         input corresponding to the max output
@@ -287,23 +287,27 @@ class Decoder(nn.Module):
         # remaining capacity
         required_capacity = before_embedded_inputs[idxs, list(range(batch_size)), 2]
         t_1 = before_embedded_inputs[idxs, list(range(batch_size)), 3]
+        t_2 = before_embedded_inputs[idxs, list(range(batch_size)), 4]
 
         # current time
         for i in range(batch_size):
             if i in nonzero_idxs:
-                cur_t = rc_ct[i][1] + distance[i]
+                cur_t = rc_ct_d_pc_pt[i][1] + distance[i]
                 if cur_t < t_1[i]:
-                    rc_ct[i][1] = t_1[i]
+                    rc_ct_d_pc_pt[i][1] = t_1[i]
                 else:
-                    rc_ct[i][1] = cur_t
+                    rc_ct_d_pc_pt[i][1] = cur_t
 
-                rc_ct[0] = rc_ct[0] - required_capacity[i]
+                rc_ct_d_pc_pt[i][0] = rc_ct_d_pc_pt[i][0] - required_capacity[i]
+                rc_ct_d_pc_pt[i][-1] += max(rc_ct_d_pc_pt[i][-1] - t_2[i], 0)  # penalty time
+                rc_ct_d_pc_pt[i][-2] += max(-rc_ct_d_pc_pt[i][0], 0)  # penalty capacity
 
-        rc_ct[zero_idxs, :] = torch.FloatTensor([self.vehicle_init_capacity, 0])
+        rc_ct_d_pc_pt[:, 2] += distance.view(-1, 1)  # cumulative distance
+        rc_ct_d_pc_pt[zero_idxs, :2] = torch.FloatTensor([self.vehicle_init_capacity, 0])  # reset capacity and time
 
-        sels[:, -2:] = rc_ct.clone()
+        sels[:, -2:] = rc_ct_d_pc_pt[:, :2].clone()  # clone part of rc_ct_pc_pt
 
-        return sels, zero_idxs, idxs, rc_ct, before_embedded_inputs, embedded_inputs
+        return sels, zero_idxs, idxs, rc_ct_d_pc_pt, before_embedded_inputs, embedded_inputs
 
 
 class PointerNetwork(nn.Module):
@@ -383,13 +387,13 @@ class PointerNetwork(nn.Module):
         decoder_input.detach_()
         if self.use_cuda:
             decoder_input = decoder_input.cuda()
-        (pointer_probs, input_idxs), dec_hidden_t = self.decoder(decoder_input,
-                                                                 inputs,  # before_embedded_inputs
-                                                                 embedded_inputs,
-                                                                 dec_init_state,
-                                                                 context)
+        (pointer_probs, input_idxs), dec_hidden_t, dist_pc_pt = self.decoder(decoder_input,
+                                                                             inputs,  # before_embedded_inputs
+                                                                             embedded_inputs,
+                                                                             dec_init_state,
+                                                                             context)
 
-        return pointer_probs, input_idxs
+        return pointer_probs, input_idxs, dist_pc_pt
 
 
 class CriticNetwork(nn.Module):
@@ -512,14 +516,8 @@ class NeuralCombOptRL(nn.Module):
 
         # query the actor net for the input indices
         # making up the output, and the pointer attn
-        probs_, action_idxs = self.actor_net(inputs)
+        probs_, action_idxs, dist_pc_pt = self.actor_net(inputs)
         # probs_: [seq_len x batch_size x seq_len], action_idxs: [seq_len x batch_size]
-
-        # Select the actions (inputs pointed to by the pointer net)
-        actions = []
-
-        for action_id in action_idxs:
-            actions.append(inputs[list(range(batch_size)), action_id, :])
 
         if self.is_train:
             # probs_ is a list of len sourceL of [batch_size x sourceL]
@@ -531,11 +529,12 @@ class NeuralCombOptRL(nn.Module):
             # return the list of len sourceL of [batch_size x sourceL]
             probs = probs_
 
+        C1 = 1e-4
+        C2 = 1e-2
+        C3 = 1e-2
+        R = torch.mm(dist_pc_pt, torch.FloatTensor([C1, C2, C3]).view(-1, 1))
         # get the critic value fn estimates for the baseline
         # [batch_size]
-        b = self.critic_net(inputs)
+        b = self.critic_net(inputs).view(-1, 1)
 
-        action_idxs = torch.cat(action_idxs, 0).view(-1, batch_size).transpose(1, 0).tolist()
-
-        # return R, b, probs, actions, action_idxs
-        return b, probs, actions, action_idxs
+        return R, b, probs, action_idxs

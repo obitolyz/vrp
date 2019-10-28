@@ -24,7 +24,7 @@ class VRPDataset(Dataset):
                 capacity = random.randint(1, 10)
                 t1 = random.uniform(0, 5)
                 t2 = t1 + 2
-                h = 0
+                h = 0  # if h is 1, it has been visited
                 sample.append(torch.FloatTensor([x, y, capacity, t1, t2, h]))
 
             self.dataset.append(torch.cat(sample, 0).view(-1, 6))
