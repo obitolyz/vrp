@@ -11,8 +11,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 # parameters
-batch_size = 2
-train_size = 1000
+batch_size = 128
+train_size = 10000
 val_size = 1000
 seq_len = 21   # servive_num and depot num
 input_dim = 2
@@ -26,7 +26,7 @@ n_glimpses = 1
 use_tanh = True
 C = 10  # tanh exploration
 n_epochs = 100
-use_cuda = True
+use_cuda = False
 random_seed = 111
 is_train = True
 critic_beta = 0.9
@@ -38,7 +38,6 @@ actor_lr_decay_rate = 0.96
 critic_lr_decay_step = 5000
 critic_lr_decay_rate = 0.96
 disable_tensorboard = False
-log_step = 50
 load_path = ''
 output_dir = 'tsp_model/A2C'
 log_dir = 'runs/A2C'
@@ -105,6 +104,7 @@ if use_cuda:
 
 step = 0
 val_step = 0
+log_step = 1
 epoch = 100
 
 
@@ -118,8 +118,8 @@ def train_one_epoch(i):
         if use_cuda:
             sample_batch = sample_batch.cuda()
 
-        R, v, probs, actions_idxs = model(copy.deepcopy(sample_batch))
-        advantage = R - v  # means L(π|s) - b(s)
+        R, b, probs, actions_idxs = model(copy.deepcopy(sample_batch))
+        advantage = R - b  # means L(π|s) - b(s)
 
         # compute the sum of the log probs for each tour in the batch
         # probs: [2(seq_len-1)+1 x batch_size], logprobs: [batch_size]
@@ -141,7 +141,7 @@ def train_one_epoch(i):
 
         # critic net processing
         R = R.detach()
-        critic_loss = critic_mse(v.squeeze(1), R)
+        critic_loss = critic_mse(b, R)
         critic_optim.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.critic_net.parameters(), max_norm=2.0, norm_type=2)
@@ -159,38 +159,38 @@ def train_one_epoch(i):
             print('epoch: {}, train_batch_id: {}, avg_reward: {}'.format(i, batch_id, R.mean().item()))
 
 
-def validation():
-    global val_step
-    model.actor_net.decoder.decode_type = 'beam_search'
-    print('\n~Validating~\n')
-
-    example_input = []
-    example_output = []
-    avg_reward = []
-
-    # put in test mode!
-    model.eval()
-
-    for batch_id, val_batch in enumerate(tqdm(validation_dataloader, disable=False)):
-        if use_cuda:
-            val_batch = val_batch.cuda()
-
-        R, v, probs, actions, action_idxs = model(val_batch)
-
-        avg_reward.append(R[0].item())
-        val_step += 1
-
-        if not disable_tensorboard:
-            writer.add_scalar('val_avg_reward', R.item(), int(val_step))
-
-        if val_step % log_step == 0:
-            print('val_avg_reward:', R.item())
-
-            if plot_att:
-                probs = torch.cat(probs, 0)
-                plot_attention(example_input, example_output, probs.cpu().numpy())
-    print('Validation overall avg_reward: {}'.format(np.mean(avg_reward)))
-    print('Validation overall reward var: {}'.format(np.var(avg_reward)))
+# def validation():
+#     global val_step
+#     model.actor_net.decoder.decode_type = 'beam_search'
+#     print('\n~Validating~\n')
+#
+#     example_input = []
+#     example_output = []
+#     avg_reward = []
+#
+#     # put in test mode!
+#     model.eval()
+#
+#     for batch_id, val_batch in enumerate(tqdm(validation_dataloader, disable=False)):
+#         if use_cuda:
+#             val_batch = val_batch.cuda()
+#
+#         R, v, probs, actions, action_idxs = model(val_batch)
+#
+#         avg_reward.append(R[0].item())
+#         val_step += 1
+#
+#         if not disable_tensorboard:
+#             writer.add_scalar('val_avg_reward', R.item(), int(val_step))
+#
+#         if val_step % log_step == 0:
+#             print('val_avg_reward:', R.item())
+#
+#             if plot_att:
+#                 probs = torch.cat(probs, 0)
+#                 plot_attention(example_input, example_output, probs.cpu().numpy())
+#     print('Validation overall avg_reward: {}'.format(np.mean(avg_reward)))
+#     print('Validation overall reward var: {}'.format(np.var(avg_reward)))
 
 
 def train_model():

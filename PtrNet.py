@@ -19,7 +19,10 @@ class Encoder(nn.Module):
 
     def forward(self, x, hidden):
         # hidden: (h0, c0)
-        output, hidden = self.lstm(x, hidden)
+        if hidden is None:
+            output, hidden = self.lstm(x)
+        else:
+            output, hidden = self.lstm(x, hidden)
         return output, hidden
 
     def init_hidden(self, hidden_dim):
@@ -157,7 +160,7 @@ class Decoder(nn.Module):
 
     def apply_mask_to_logits(self, logits, mask, prev_idxs):
         if mask is None:
-            mask = torch.zeros(logits.size()).long()
+            mask = torch.zeros(logits.size()).byte()
             if self.use_cuda:
                 mask = mask.cuda()
 
@@ -172,7 +175,7 @@ class Decoder(nn.Module):
             logits[maskk] = -np.inf
         return logits, maskk
 
-    def forward(self, decoder_input, before_embedded_inputs, embedded_inputs, hidden_origin, context_origin):
+    def forward(self, decoder_input, before_embedded_inputs_origin, embedded_inputs_origin, hidden_origin, context_origin):
         """
         Args:
             decoder_input: The initial input to the decoder
@@ -192,20 +195,28 @@ class Decoder(nn.Module):
             cy = cy.squeeze(0)
 
             g_l = hy
-            for _ in range(self.n_glimpses):
-                ref, logits = self.glimpse(g_l, context)
-                logits, logit_mask = self.apply_mask_to_logits(logits, logit_mask, prev_idxs)
-                # [batch_size x h_dim x sourceL] * [batch_size x sourceL x 1] = [batch_size x h_dim x 1]
-                g_l = torch.bmm(ref, self.sm(logits).unsqueeze(2)).squeeze(2)
+            # for _ in range(self.n_glimpses):
+            #     ref, logits = self.glimpse(g_l, context)
+            #     logits, logit_mask = self.apply_mask_to_logits(logits, logit_mask, prev_idxs)
+            #     # [batch_size x h_dim x sourceL] * [batch_size x sourceL x 1] = [batch_size x h_dim x 1]
+            #     g_l = torch.bmm(ref, self.sm(logits).unsqueeze(2)).squeeze(2)
             _, logits = self.pointer(g_l, context)
 
             logits, logit_mask = self.apply_mask_to_logits(logits, logit_mask, prev_idxs)
             # probs: [batch_size x sourceL]
             probs = self.sm(logits)
+            replace = torch.zeros(probs.size())
+            replace[:, 0] = 1
+            if self.use_cuda:
+                replace = replace.cuda()
+            probs = torch.where(probs != probs, replace, probs)
             return hy, cy, probs, logit_mask
 
-        hidden = (hidden_origin[0].clone().detach(), hidden_origin[1].clone().detach())  ###
+        # why do that
+        hidden = (hidden_origin[0].clone().detach(), hidden_origin[1].clone().detach())
         context = context_origin.clone().detach()
+        before_embedded_inputs = before_embedded_inputs_origin.clone().detach()
+        embedded_inputs = embedded_inputs_origin.clone().detach()
 
         batch_size = context.size(1)
         sourceL = context.size(0)
@@ -236,14 +247,15 @@ class Decoder(nn.Module):
                     probs, before_embedded_inputs, embedded_inputs, idxs, rc_ct_d_pc_pt)
 
                 # re-encode the embedded_inputs which are modified
-                context_change, (enc_h_t_change, enc_c_t_change) = self.encoder(embedded_inputs[:, zero_idxs, :],
-                                                                                None)  # h0, c0 is default 0
+                context_change, (enc_h_t_change, enc_c_t_change) = self.encoder(embedded_inputs[:, zero_idxs, :], None)  # h0, c0 is default 0
 
                 # update context, hidden
                 context[:, zero_idxs, :] = context_change
-                hx[zero_idxs, :] = enc_h_t_change[-1]
-                cx[zero_idxs, :] = enc_c_t_change[-1]
-                hidden = (hx, cx)
+                # the problem is very big, big, big
+                hx_copy, cx_copy = hx.clone(), cx.clone()
+                hx_copy[zero_idxs, :] = enc_h_t_change[-1]
+                cx_copy[zero_idxs, :] = enc_c_t_change[-1]
+                hidden = (hx_copy, cx_copy)
 
                 # use outs to point to next object
                 outputs.append(probs)
@@ -277,11 +289,6 @@ class Decoder(nn.Module):
         batch_size = probs.size(0)
         # idxs is [batch_size]
         # if prob is all nan, select depot 0
-        replace = torch.zeros(probs.size())
-        replace[:, 0] = 1
-        if self.use_cuda:
-            replace = replace.cuda()
-        probs = torch.where(probs != probs, replace, probs)
         idxs = probs.multinomial(1).squeeze(1)
 
         # nonzero
@@ -406,7 +413,7 @@ class PointerNetwork(nn.Module):
         decoder_input = torch.zeros(embedded_inputs.size(1), self.embedding_dim + 2)  # remaining capacity, current time
         decoder_input[:, -2] = self.vehicle_init_capacity
         decoder_input[:, :-2] = embedded_inputs[0].clone()
-        decoder_input.detach_()
+        decoder_input = decoder_input.detach()
         if self.use_cuda:
             decoder_input = decoder_input.cuda()
         (pointer_probs, input_idxs), dec_hidden_t, dist_pc_pt = self.decoder(decoder_input,
