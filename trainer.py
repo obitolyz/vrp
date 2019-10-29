@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # parameters
 batch_size = 128
-train_size = 10000
+train_size = batch_size * 100
 val_size = 1000
 seq_len = 21   # servive_num and depot num
 input_dim = 2
@@ -118,7 +118,7 @@ def train_one_epoch(i):
         if use_cuda:
             sample_batch = sample_batch.cuda()
 
-        R, b, probs, actions_idxs = model(copy.deepcopy(sample_batch))
+        R, b, probs, actions_idxs, dist_pc_pt = model(copy.deepcopy(sample_batch))
         advantage = R - b  # means L(π|s) - b(s)
 
         # compute the sum of the log probs for each tour in the batch
@@ -157,6 +157,7 @@ def train_one_epoch(i):
 
         if step % log_step == 0:
             print('epoch: {}, train_batch_id: {}, avg_reward: {}'.format(i, batch_id, R.mean().item()))
+            print('dist_pc_pt:', dist_pc_pt)
 
 
 # def validation():

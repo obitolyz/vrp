@@ -325,7 +325,7 @@ class Decoder(nn.Module):
                     rc_ct_d_pc_pt[i][1] = cur_t
 
                 rc_ct_d_pc_pt[i][0] = rc_ct_d_pc_pt[i][0] - required_capacity[i]
-                rc_ct_d_pc_pt[i][-1] = rc_ct_d_pc_pt[i][-1] + max(rc_ct_d_pc_pt[i][-1] - t_2[i], 0)  # penalty time
+                rc_ct_d_pc_pt[i][-1] = rc_ct_d_pc_pt[i][-1] + max(rc_ct_d_pc_pt[i][1] - t_2[i], 0)  # penalty time
                 rc_ct_d_pc_pt[i][-2] = rc_ct_d_pc_pt[i][-2] + max(-rc_ct_d_pc_pt[i][0], 0)  # penalty capacity
 
         rc_ct_d_pc_pt[:, 2] = rc_ct_d_pc_pt[:, 2] + distance  # cumulative distance
@@ -556,9 +556,9 @@ class NeuralCombOptRL(nn.Module):
             # return the list of len sourceL of [batch_size x sourceL]
             probs = probs_
 
-        C1 = 1e-4
-        C2 = 1e-2
-        C3 = 1e-2
+        C1 = 1
+        C2 = 1e-1
+        C3 = 1e-1
         cff = torch.FloatTensor([C1, C2, C3])
         if self.use_cuda:
             cff = cff.cuda()
@@ -568,4 +568,4 @@ class NeuralCombOptRL(nn.Module):
         # [batch_size]
         b = self.critic_net(inputs).squeeze(1)
 
-        return R, b, probs, action_idxs
+        return R, b, probs, action_idxs, dist_pc_pt
