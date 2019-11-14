@@ -1,7 +1,6 @@
 import torch
 import os
 import copy
-import numpy as np
 import Data_Generator
 import torch.optim as optim
 from PtrNet import NeuralCombOptRL
@@ -158,6 +157,7 @@ def train_one_epoch(i):
         if step % log_step == 0:
             print('epoch: {}, train_batch_id: {}, avg_reward: {}'.format(i, batch_id, R.mean().item()))
             print('dist_pc_pt:', dist_pc_pt)
+            print('actions_idxs', actions_idxs)
 
 
 # def validation():

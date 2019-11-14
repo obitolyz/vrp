@@ -59,11 +59,15 @@ class Struct2Vec(nn.Module):
         self.theta_4 = nn.Linear(6, self.p_dim, bias=False)  # service node
         self.theta_5 = nn.Linear(2, self.p_dim, bias=False)  # depot node
 
-    def forward(self, inputs):
+    def forward(self, inputs_origin):
         """
         :param inputs: [sourceL x batch_size x input_dim], where input_dim: 6
         :return: [sourceL x batch_size x embedded_dim]
         """
+        inputs = inputs_origin.clone()
+        inputs[:, :, 2] = inputs[:, :, 2] / 10
+        inputs[:, :, 3] = inputs[:, :, 3] / 7
+        inputs[:, :, 4] = inputs[:, :, 4] / 7
         batch_size = inputs.size(1)
         N = self.node_num
         mu = torch.zeros(N, batch_size, self.p_dim)
@@ -558,10 +562,12 @@ class NeuralCombOptRL(nn.Module):
 
         C1 = 1
         C2 = 1e-1
-        C3 = 1e-1
+        C3 = 1
         cff = torch.FloatTensor([C1, C2, C3])
         if self.use_cuda:
             cff = cff.cuda()
+
+        action_idxs = torch.cat(action_idxs, 0).view(-1, batch_size).transpose(1, 0).tolist()
 
         R = torch.mm(dist_pc_pt, cff.view(-1, 1)).squeeze(1)  # calc reward
         # get the critic value fn estimates for the baseline
